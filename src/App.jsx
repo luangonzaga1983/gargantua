@@ -5,25 +5,69 @@ import { EffectComposer, Bloom, Vignette } from "@react-three/postprocessing";
 import { BlendFunction } from "postprocessing";
 import Blackhole from "./components/Blackhole";
 
-const MASS = 1.5;
-const SPIN = 0.8;
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const MASS     = 1.5;
+const SPIN     = 0.8;
+const CAM_POS  = [10, 14, 26];
 const PASSWORD = "Edineia1983.";
-const CAM_POS = [10, 14, 26];
-const WEBHOOK = "https://discord.com/api/webhooks/1505342531825827941/2KNYWnT2SFQ0qUbXE7RBKQPW3X3oj0kwWt-Q3JLaRd4mpHUbrVgVLZnteftDjEqzm7SH";
+const WEBHOOK  = "https://discord.com/api/webhooks/1505342531825827941/2KNYWnT2SFQ0qUbXE7RBKQPW3X3oj0kwWt-Q3JLaRd4mpHUbrVgVLZnteftDjEqzm7SH";
+const OR_TOKEN = "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";
+const OR_MODEL = "openai/gpt-4o-mini";
 
-const SYSTEM_PROMPT = `Voce e um agente pessoal de automacao. O usuario vai pedir tarefas como abrir programas, sites, executar comandos, etc.
+const SYSTEM_PROMPT = `Voce e um agente pessoal de automacao rodando no Windows.
+
+Responda SEMPRE em JSON puro, sem markdown, sem crases.
+
+FORMATO OBRIGATORIO:
+{"thoughts": "raciocinio interno", "steps": [ ... ]}
+
+TIPOS DE STEPS:
+{"type": "open_url",  "url":  "https://..."}
+{"type": "open_app",  "app":  "notepad.exe"}
+{"type": "run_cmd",   "cmd":  "comando powershell"}
+{"type": "message",   "text": "mensagem ao usuario"}
 
 REGRAS:
-- Sempre responda em dois blocos separados:
-  1. Uma mensagem curta e direta em texto normal explicando o que vai fazer.
-  2. Um bloco de codigo marcado com triple-backtick cmd ou powershell contendo o comando exato a executar.
-- Se a tarefa nao precisar de codigo (pergunta simples, conversa), responda normalmente sem bloco de codigo.
-- Sem emojis. Sem firulas. Seja direto e preciso.
-- Os comandos serao lidos por um programa local no PC do usuario e executados automaticamente.
-- Para abrir sites use: start https://site.com
-- Para abrir programas use o nome do executavel ou o caminho completo.
-- Para multiplas acoes, coloque tudo no mesmo bloco separado por linhas.`;
+1. SEMPRE JSON valido
+2. Para abrir sites use open_url
+3. Para abrir programas use open_app
+4. Para qualquer outro comando use run_cmd
+5. SEMPRE inclua um step "message" respondendo ao usuario
+6. Sem emojis
+7. Seja direto e preciso
+8. Responda normalmente a qualquer mensagem, seja um oi, pergunta ou tarefa`;
 
+// ─── API ──────────────────────────────────────────────────────────────────────
+async function askAgent(messages) {
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OR_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OR_MODEL,
+      temperature: 0.2,
+      max_tokens: 2048,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        ...messages.slice(-30),
+      ],
+    }),
+  });
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content?.trim() ?? "";
+}
+
+function parseJSON(raw) {
+  let text = raw.replace(/```(?:json)?/g, "").replace(/```/g, "").trim();
+  try { return JSON.parse(text); } catch {}
+  const m = text.match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch {} }
+  return null;
+}
+
+// ─── WEBHOOK ──────────────────────────────────────────────────────────────────
 async function sendToWebhook(content) {
   try {
     await fetch(WEBHOOK, {
@@ -31,56 +75,35 @@ async function sendToWebhook(content) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
     });
-  } catch (e) {
-    console.error("Webhook error:", e);
-  }
+  } catch (e) { console.error("Webhook:", e); }
 }
 
-function extractCode(text) {
-  const regex = /```(?:cmd|powershell|bat|bash|sh)\n?([\s\S]*?)```/gi;
-  const matches = [];
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    matches.push(match[1].trim());
+// Monta o bloco de comando que o programa local vai executar
+function buildDispatchPayload(steps) {
+  const lines = [];
+  for (const s of steps) {
+    if (s.type === "open_url") lines.push(`start ${s.url}`);
+    else if (s.type === "open_app") lines.push(s.app);
+    else if (s.type === "run_cmd") lines.push(s.cmd);
   }
-  return matches.join("\n");
+  return lines.join("\n");
 }
 
-function parseMessage(text) {
-  const parts = [];
-  const regex = /```(\w+)?\n?([\s\S]*?)```/g;
-  let last = 0;
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > last) {
-      const chunk = text.slice(last, match.index).trim();
-      if (chunk) parts.push({ type: "text", content: chunk });
-    }
-    parts.push({ type: "code", lang: match[1] || "cmd", content: match[2].trim() });
-    last = match.index + match[0].length;
+// ─── PARSE RESPOSTA ───────────────────────────────────────────────────────────
+// Retorna { text, cmdPayload } para exibir no chat
+function processReply(raw) {
+  const parsed = parseJSON(raw);
+  if (!parsed || !parsed.steps) {
+    // fallback: resposta em texto puro
+    return { text: raw, cmdPayload: null };
   }
-  if (last < text.length) {
-    const rest = text.slice(last).trim();
-    if (rest) parts.push({ type: "text", content: rest });
-  }
-  return parts;
+  const msgStep = parsed.steps.find(s => s.type === "message");
+  const text = msgStep?.text ?? parsed.thoughts ?? "";
+  const payload = buildDispatchPayload(parsed.steps);
+  return { text, cmdPayload: payload || null };
 }
 
-async function askAgent(messages) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      system: SYSTEM_PROMPT,
-      messages,
-    }),
-  });
-  const data = await res.json();
-  return data.content?.[0]?.text ?? "";
-}
-
+// ─── THREE ────────────────────────────────────────────────────────────────────
 function CameraSetup() {
   const { camera } = useThree();
   useEffect(() => {
@@ -90,40 +113,31 @@ function CameraSetup() {
   return null;
 }
 
-function CodeBlock({ lang, content, dispatched }) {
+// ─── COMPONENTES ──────────────────────────────────────────────────────────────
+function CmdBlock({ content, dispatched }) {
   return (
     <div style={{
       marginTop: "10px",
       background: "rgba(0,0,0,0.6)",
       border: "1px solid rgba(255,255,255,0.09)",
-      borderRadius: "8px",
-      overflow: "hidden",
+      borderRadius: "8px", overflow: "hidden",
     }}>
       <div style={{
         display: "flex", alignItems: "center", justifyContent: "space-between",
-        padding: "5px 12px",
-        borderBottom: "1px solid rgba(255,255,255,0.07)",
+        padding: "5px 12px", borderBottom: "1px solid rgba(255,255,255,0.07)",
       }}>
-        <span style={{
-          fontSize: "10px", letterSpacing: "0.15em",
-          color: "rgba(255,255,255,0.28)", textTransform: "uppercase",
-        }}>
-          {lang}
+        <span style={{ fontSize: "10px", letterSpacing: "0.15em", color: "rgba(255,255,255,0.28)", textTransform: "uppercase" }}>
+          cmd
         </span>
         {dispatched && (
-          <span style={{
-            fontSize: "10px", letterSpacing: "0.12em",
-            color: "rgba(140,220,140,0.65)", textTransform: "uppercase",
-          }}>
+          <span style={{ fontSize: "10px", letterSpacing: "0.12em", color: "rgba(140,220,140,0.65)", textTransform: "uppercase" }}>
             enviado
           </span>
         )}
       </div>
       <pre style={{
-        margin: 0, padding: "12px 14px",
-        fontSize: "12px", lineHeight: "1.7",
-        color: "rgba(255,255,255,0.7)",
-        fontFamily: "'JetBrains Mono', monospace",
+        margin: 0, padding: "12px 14px", fontSize: "12px", lineHeight: "1.7",
+        color: "rgba(255,255,255,0.7)", fontFamily: "'JetBrains Mono', monospace",
         overflowX: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all",
       }}>
         {content}
@@ -132,14 +146,12 @@ function CodeBlock({ lang, content, dispatched }) {
   );
 }
 
-function ChatMessage({ role, parts, dispatched }) {
+function ChatMessage({ role, text, cmdPayload, dispatched }) {
   const isUser = role === "user";
   return (
     <div style={{
-      display: "flex",
-      justifyContent: isUser ? "flex-end" : "flex-start",
-      marginBottom: "20px",
-      animation: "fadeUp 0.3s ease forwards",
+      display: "flex", justifyContent: isUser ? "flex-end" : "flex-start",
+      marginBottom: "20px", animation: "fadeUp 0.3s ease forwards",
     }}>
       <div style={{
         maxWidth: "86%",
@@ -154,34 +166,33 @@ function ChatMessage({ role, parts, dispatched }) {
         fontFamily: "'JetBrains Mono', monospace",
         letterSpacing: "0.01em",
       }}>
-        {isUser
-          ? <span>{parts[0]?.content}</span>
-          : parts.map((p, i) =>
-              p.type === "code"
-                ? <CodeBlock key={i} lang={p.lang} content={p.content} dispatched={dispatched} />
-                : <p key={i} style={{ margin: i > 0 ? "8px 0 0" : "0", color: "rgba(255,255,255,0.7)" }}>{p.content}</p>
-            )
-        }
+        <span style={{ color: isUser ? "rgba(255,255,255,0.78)" : "rgba(255,255,255,0.7)", whiteSpace: "pre-wrap" }}>
+          {text}
+        </span>
+        {cmdPayload && (
+          <CmdBlock content={cmdPayload} dispatched={dispatched} />
+        )}
       </div>
     </div>
   );
 }
 
+// ─── APP ──────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [screen, setScreen] = useState("password");
-  const [pwInput, setPwInput] = useState("");
-  const [pwError, setPwError] = useState(false);
-  const [pwShake, setPwShake] = useState(false);
-
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [screen, setScreen]           = useState("password");
+  const [pwInput, setPwInput]         = useState("");
+  const [pwError, setPwError]         = useState(false);
+  const [pwShake, setPwShake]         = useState(false);
+  const [messages, setMessages]       = useState([]);   // {role, text, cmdPayload, id}
+  const [apiHistory, setApiHistory]   = useState([]);   // {role, content} para a API
+  const [input, setInput]             = useState("");
+  const [loading, setLoading]         = useState(false);
   const [dispatchedIds, setDispatchedIds] = useState(new Set());
-  const [fadeChat, setFadeChat] = useState(false);
+  const [fadeChat, setFadeChat]       = useState(false);
 
-  const orbitRef = useRef(null);
-  const inputRef = useRef(null);
-  const pwRef = useRef(null);
+  const orbitRef  = useRef(null);
+  const inputRef  = useRef(null);
+  const pwRef     = useRef(null);
   const scrollRef = useRef(null);
 
   useEffect(() => { setTimeout(() => pwRef.current?.focus(), 300); }, []);
@@ -198,8 +209,7 @@ export default function App() {
       setScreen("chat");
       setTimeout(() => setFadeChat(true), 10);
     } else {
-      setPwError(true);
-      setPwShake(true);
+      setPwError(true); setPwShake(true);
       setTimeout(() => setPwShake(false), 500);
       setPwInput("");
     }
@@ -219,40 +229,34 @@ export default function App() {
     const text = input.trim();
     if (!text || loading) return;
 
-    const apiHistory = [
-      ...messages.map(m => ({
-        role: m.role,
-        content: m.parts.map(p => p.content).join("\n"),
-      })),
-      { role: "user", content: text },
-    ];
-
-    setMessages(prev => [...prev, { role: "user", parts: [{ type: "text", content: text }] }]);
+    const newApiHistory = [...apiHistory, { role: "user", content: text }];
+    setApiHistory(newApiHistory);
+    setMessages(prev => [...prev, { role: "user", text, cmdPayload: null, id: null }]);
     setInput("");
     setLoading(true);
 
     try {
-      const answer = await askAgent(apiHistory);
-      const parts = parseMessage(answer);
+      const raw = await askAgent(newApiHistory);
+      const { text: replyText, cmdPayload } = processReply(raw);
       const msgId = Date.now();
-      setMessages(prev => [...prev, { role: "assistant", parts, id: msgId }]);
 
-      const code = extractCode(answer);
-      if (code) {
-        await sendToWebhook("```\n" + code + "\n```");
+      setApiHistory(prev => [...prev, { role: "assistant", content: raw }]);
+      setMessages(prev => [...prev, { role: "assistant", text: replyText, cmdPayload, id: msgId }]);
+
+      if (cmdPayload) {
+        await sendToWebhook("```\n" + cmdPayload + "\n```");
         setDispatchedIds(prev => new Set([...prev, msgId]));
       }
-    } catch {
+    } catch (err) {
+      console.error(err);
       setMessages(prev => [...prev, {
-        role: "assistant",
-        parts: [{ type: "text", content: "Falha na comunicacao com o agente." }],
-        id: Date.now(),
+        role: "assistant", text: "Falha na comunicacao com o agente.", cmdPayload: null, id: Date.now(),
       }]);
     } finally {
       setLoading(false);
       setTimeout(() => inputRef.current?.focus(), 100);
     }
-  }, [input, loading, messages]);
+  }, [input, loading, apiHistory]);
 
   const handleKeyDown = useCallback((e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSubmit(); }
@@ -277,8 +281,7 @@ export default function App() {
             <Blackhole mass={MASS} spin={SPIN} />
           </Suspense>
           <OrbitControls
-            ref={orbitRef}
-            enabled={screen === "appreciate"}
+            ref={orbitRef} enabled={screen === "appreciate"}
             enablePan={false} enableDamping dampingFactor={0.05}
             minDistance={6} maxDistance={90}
           />
@@ -351,8 +354,6 @@ export default function App() {
           opacity: fadeChat ? 1 : 0, transition: "opacity 0.6s ease",
           pointerEvents: fadeChat ? "auto" : "none",
         }}>
-
-          {/* Top */}
           <div style={{ display: "flex", justifyContent: "center", padding: "1.4rem 2rem 0", flexShrink: 0 }}>
             <button onClick={handleApreciar} style={{
               background: "transparent", border: "none",
@@ -367,7 +368,6 @@ export default function App() {
             </button>
           </div>
 
-          {/* Messages */}
           <div ref={scrollRef} style={{
             flex: 1, overflowY: "auto", padding: "1.5rem 0",
             display: "flex", flexDirection: "column",
@@ -384,19 +384,19 @@ export default function App() {
             )}
             <div style={{ maxWidth: "680px", width: "100%", margin: "0 auto", padding: "0 1.5rem" }}>
               {messages.map((msg, i) => (
-                <ChatMessage key={i} role={msg.role} parts={msg.parts} dispatched={dispatchedIds.has(msg.id)} />
+                <ChatMessage
+                  key={i} role={msg.role} text={msg.text}
+                  cmdPayload={msg.cmdPayload} dispatched={dispatchedIds.has(msg.id)}
+                />
               ))}
               {loading && (
                 <div style={{ marginBottom: "18px", animation: "fadeUp 0.3s ease forwards" }}>
-                  <span style={{ color: "rgba(255,255,255,0.22)", letterSpacing: "0.3em", fontSize: "13px" }}>
-                    . . .
-                  </span>
+                  <span style={{ color: "rgba(255,255,255,0.22)", letterSpacing: "0.3em", fontSize: "13px" }}>. . .</span>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Input */}
           <div style={{ padding: "0 1.5rem 1.8rem", flexShrink: 0 }}>
             <div style={{ maxWidth: "680px", width: "100%", margin: "0 auto", position: "relative" }}>
               <textarea
